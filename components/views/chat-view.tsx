@@ -22,24 +22,15 @@ export default function ChatView() {
   const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
   const [tokensSaved, setTokensSaved] = useState<number>(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  
-  // Detect localhost immediately (not in state to avoid race conditions)
-  const isLocalhost = typeof window !== 'undefined' && 
-    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
 
-  // Check Ollama availability when in PC mode (only works on localhost)
+  // Check Ollama/Bridge availability when in PC mode
   useEffect(() => {
     if (settings.mode === 'pc' && isLoaded) {
-      if (isLocalhost) {
-        checkOllamaAvailable(settings.ollamaUrl).then(setOllamaAvailable);
-      } else {
-        // Can't access localhost from remote site
-        setOllamaAvailable(false);
-      }
+      checkOllamaAvailable(settings.ollamaUrl, settings.bridgeUrl).then(setOllamaAvailable);
     } else {
       setOllamaAvailable(null);
     }
-  }, [settings.mode, settings.ollamaUrl, isLoaded, isLocalhost]);
+  }, [settings.mode, settings.ollamaUrl, settings.bridgeUrl, isLoaded]);
 
   const scrollToBottom = () => {
     messagesEndRef?.current?.scrollIntoView?.({ behavior: 'smooth' });
@@ -66,18 +57,18 @@ export default function ChatView() {
       let compressedContext: string | undefined;
       let saved = 0;
 
-      // === MODO PC: Pre-procesar con Ollama, luego GPT-5.2 ===
-      // Solo intenta usar Ollama si estamos en localhost Y Ollama está disponible
-      if (settings.mode === 'pc' && ollamaAvailable && isLocalhost) {
+      // === MODO PC: Pre-procesar con Ollama/Bridge, luego GPT-5.2 ===
+      if (settings.mode === 'pc' && ollamaAvailable) {
         try {
-          // Paso 1: Ollama comprime el contexto localmente
+          // Paso 1: Ollama comprime el contexto (vía bridge si está configurado)
           const compression = await compressContextWithOllama(
             settings.ollamaUrl,
             settings.ollamaModel,
             memories ?? [],
             messages ?? [],
             content,
-            fileContent
+            fileContent,
+            settings.bridgeUrl
           );
           
           compressedContext = compression.compressedContext;
@@ -347,7 +338,7 @@ CREATE TABLE memories (
               modeInfo.status === 'connected' 
                 ? `Modo híbrido activo - Ollama comprime, GPT-5.2 responde. Tokens ahorrados: ~${tokensSaved}` 
                 : modeInfo.status === 'disconnected' 
-                ? (!isLocalhost ? 'Modo PC requiere correr la app localmente (yarn dev)' : 'Ollama no detectado - usando modo Cloud directo')
+                ? 'Ollama no detectado - verifica que esté corriendo (ollama serve)'
                 : modeInfo.status === 'checking' 
                 ? 'Verificando conexión con Ollama...' 
                 : 'Modo Cloud - GPT-5.2 directo'
@@ -362,13 +353,6 @@ CREATE TABLE memories (
               <span className="text-[10px] text-green-500 ml-1">-{tokensSaved}tk</span>
             )}
           </div>
-          
-          {/* Warning banner for PC mode on production */}
-          {settings.mode === 'pc' && !isLocalhost && (
-            <div className="absolute top-full left-0 right-0 bg-orange-500/90 text-white text-xs px-3 py-1.5 text-center">
-              ⚠️ Modo PC solo funciona en localhost. Usa modo Cloud o corre la app localmente.
-            </div>
-          )}
         </div>
       </div>
 

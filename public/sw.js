@@ -1,4 +1,4 @@
-const CACHE_NAME = 'kaede-v1';
+const CACHE_NAME = 'kaede-v2';
 const OFFLINE_URL = '/offline.html';
 
 const PRECACHE_ASSETS = [
@@ -33,6 +33,21 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  
+  // Skip Ollama requests - let them pass through directly
+  if (url.hostname === 'localhost' && url.port === '11434') {
+    return;
+  }
+  if (url.hostname === '127.0.0.1' && url.port === '11434') {
+    return;
+  }
+  
+  // Skip external API requests
+  if (!url.origin.includes(self.location.origin)) {
+    return;
+  }
+
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request).catch(() => {

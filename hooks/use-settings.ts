@@ -135,4 +135,3 @@ export function useSettings() {
     getEffectiveTheme,
   };
 }
-
