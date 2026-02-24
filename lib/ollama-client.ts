@@ -13,25 +13,29 @@
 import { Memory, Message } from './database.types';
 
 /**
- * Verifica si Ollama está disponible localmente
- * Usa el endpoint raíz que tiene menos restricciones CORS
+ * Verifica si Ollama/Bridge está disponible
+ * Si bridgeUrl está configurado, usa el bridge remoto
+ * Si no, usa el API route local como proxy
  */
-export async function checkOllamaAvailable(ollamaUrl: string): Promise<boolean> {
+export async function checkOllamaAvailable(ollamaUrl: string, bridgeUrl?: string): Promise<boolean> {
   try {
-    // Usar endpoint raíz - más permisivo con CORS
-    const response = await fetch(ollamaUrl, {
+    // Si hay bridge URL configurado, usarlo directamente
+    const targetUrl = bridgeUrl ? `${bridgeUrl}/health` : '/api/ollama';
+    
+    const response = await fetch(targetUrl, {
       method: 'GET',
-      mode: 'cors',
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(5000),
     });
-    // Ollama responde "Ollama is running" en el endpoint raíz
+    
     if (response.ok) {
-      const text = await response.text();
-      return text.includes('Ollama');
+      const data = await response.json();
+      // El bridge devuelve { status: 'ok', ollama: true/false }
+      // El API route local devuelve { available: true/false }
+      return data.available === true || data.ollama === true;
     }
     return false;
   } catch (error) {
-    console.log('Ollama check failed:', error);
+    console.log('Ollama/Bridge check failed:', error);
     return false;
   }
 }
@@ -61,7 +65,8 @@ export async function compressContextWithOllama(
   memories: Memory[],
   recentMessages: Message[],
   currentMessage: string,
-  fileContent?: string
+  fileContent?: string,
+  bridgeUrl?: string
 ): Promise<{ compressedContext: string; tokensSaved: number }> {
   
   // Construir el contexto a comprimir
@@ -123,7 +128,12 @@ export async function compressContextWithOllama(
   
   try {
     // Llamar a Ollama para comprimir
-    const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+    // Si hay bridge URL, usarlo; si no, usar el API route local
+    const targetUrl = bridgeUrl 
+      ? `${bridgeUrl}/v1/chat/completions` 
+      : '/api/ollama';
+    
+    const response = await fetch(targetUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
