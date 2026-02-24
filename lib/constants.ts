@@ -14,7 +14,7 @@ export const DEFAULT_SETTINGS = {
   temperature: 0.8,
   hapticEnabled: true,
   mode: 'cloud' as const,
-  cloudModel: 'gpt-4o',
+  cloudModel: 'gpt-5.2',
   ollamaUrl: 'http://localhost:11434',
   ollamaModel: 'llama3.2',
   theme: 'light' as const,
@@ -53,5 +53,5 @@ export const CLOUD_MODELS = [
   { value: 'gpt-5.2', label: 'GPT-5.2 (Recomendado)' },
   { value: 'gpt-4o', label: 'GPT-4o' },
   { value: 'gpt-4o-mini', label: 'GPT-4o Mini (Económico)' },
-  { value: 'GPT-4 Turbo', label: 'GPT-4 Turbo' },
+  { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
 ];
