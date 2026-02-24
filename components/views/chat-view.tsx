@@ -8,7 +8,7 @@ import { useMessages, useSavedNotes, useMemories, resetTableCheck } from '@/hook
 import { useSettings } from '@/hooks/use-settings';
 import { useVoice } from '@/hooks/use-voice';
 import { Message } from '@/lib/database.types';
-import { buildClientContext, callOllamaDirectly, processOllamaStream, checkOllamaAvailable } from '@/lib/ollama-client';
+import { checkOllamaAvailable, compressContextWithOllama } from '@/lib/ollama-client';
 import { AlertCircle, ExternalLink, RefreshCw, Cloud, Monitor, Volume2, VolumeX, Wifi, WifiOff } from 'lucide-react';
 
 export default function ChatView() {
@@ -20,12 +20,15 @@ export default function ChatView() {
   const [isTyping, setIsTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
   const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
+  const [tokensSaved, setTokensSaved] = useState<number>(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Check Ollama availability when in PC mode
   useEffect(() => {
     if (settings.mode === 'pc' && isLoaded) {
       checkOllamaAvailable(settings.ollamaUrl).then(setOllamaAvailable);
+    } else {
+      setOllamaAvailable(null);
     }
   }, [settings.mode, settings.ollamaUrl, isLoaded]);
 
@@ -50,101 +53,80 @@ export default function ChatView() {
     setStreamingContent('');
 
     try {
-      const currentModel = getCurrentModel();
       let fullContent = '';
+      let compressedContext: string | undefined;
+      let saved = 0;
 
-      // Prepare user message with file content if any
-      const userMessage = fileContent 
-        ? `[Archivo adjunto]\n\nContenido del archivo:\n${fileContent}\n\n---\n\nMensaje del usuario: ${content}`
-        : content;
-
-      // === MODO PC: Llamada directa a Ollama desde el navegador ===
-      if (settings.mode === 'pc') {
-        // Build context with memories (from Supabase) + buffer messages
-        const contextMessages = buildClientContext(
-          memories ?? [],
-          messages ?? [],
-          settings.maxTokens
-        );
-        
-        // Add the new user message
-        contextMessages.push({ role: 'user', content: userMessage });
-
+      // === MODO PC: Pre-procesar con Ollama, luego GPT-5.2 ===
+      if (settings.mode === 'pc' && ollamaAvailable) {
         try {
-          // Call Ollama directly from the browser
-          const response = await callOllamaDirectly(
+          // Paso 1: Ollama comprime el contexto localmente
+          const compression = await compressContextWithOllama(
             settings.ollamaUrl,
-            currentModel,
-            contextMessages,
-            settings.temperature
+            settings.ollamaModel,
+            memories ?? [],
+            messages ?? [],
+            content,
+            fileContent
           );
-
-          // Process streaming response
-          fullContent = await processOllamaStream(response, (chunk) => {
-            setStreamingContent(chunk);
-          });
-        } catch (ollamaError: unknown) {
-          const errorMsg = ollamaError instanceof Error ? ollamaError.message : 'Error desconocido';
           
-          // Check if it's a connection error (CORS or network)
-          if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
-            throw new Error(
-              'No se puede conectar con Ollama. Asegúrate de:\n' +
-              '1. Ollama está corriendo: ollama serve\n' +
-              '2. CORS habilitado: OLLAMA_ORIGINS=* ollama serve\n' +
-              '3. Estás en tu Mac local'
-            );
-          }
-          throw ollamaError;
+          compressedContext = compression.compressedContext;
+          saved = compression.tokensSaved;
+          setTokensSaved(prev => prev + saved);
+          
+        } catch (ollamaError) {
+          console.warn('Ollama compression failed, using full context:', ollamaError);
+          // Si Ollama falla, continuar sin comprimir
         }
-      } 
-      // === MODO CLOUD: Usa el API route (Vercel/Abacus → OpenAI) ===
-      else {
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: content,
-            maxTokens: settings.maxTokens,
-            temperature: settings.temperature,
-            model: currentModel,
-            mode: 'cloud',
-            fileContent: fileContent,
-          }),
-        });
+      }
 
-        // Handle non-streaming error responses
-        if (!response?.ok) {
-          const errorData = await response.json().catch(() => ({ error: 'Error desconocido' }));
-          throw new Error(errorData.error || 'Failed to get response');
-        }
+      // === AMBOS MODOS: Enviar a GPT-5.2 (siempre es el cerebro de Kaede) ===
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: content,
+          maxTokens: settings.maxTokens,
+          temperature: settings.temperature,
+          model: settings.cloudModel, // Siempre GPT-5.2
+          mode: 'cloud', // Siempre cloud porque GPT-5.2 es el cerebro
+          fileContent: fileContent,
+          // En modo PC, enviar contexto comprimido
+          compressedContext: compressedContext,
+        }),
+      });
 
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
+      // Handle non-streaming error responses
+      if (!response?.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Error desconocido' }));
+        throw new Error(errorData.error || 'Failed to get response');
+      }
 
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
 
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n');
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-                
-                try {
-                  const parsed = JSON.parse(data);
-                  const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
-                  if (deltaContent) {
-                    fullContent += deltaContent;
-                    setStreamingContent(fullContent);
-                  }
-                } catch {
-                  // Skip invalid JSON
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+              
+              try {
+                const parsed = JSON.parse(data);
+                const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
+                if (deltaContent) {
+                  fullContent += deltaContent;
+                  setStreamingContent(fullContent);
                 }
+              } catch {
+                // Skip invalid JSON
               }
             }
           }
@@ -157,7 +139,6 @@ export default function ChatView() {
         
         // Auto TTS if enabled
         if (settings.voice?.ttsEnabled && ttsSupported) {
-          // Clean content for speech (remove emojis and special chars)
           const cleanContent = fullContent
             .replace(/[\u{1F600}-\u{1F64F}]/gu, '')
             .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')
@@ -177,11 +158,11 @@ export default function ChatView() {
       console.error('Chat error:', err);
       const errorMessage = err instanceof Error ? err.message : 'Error desconocido';
       
-      let displayError = errorMessage;
-      if (settings.mode === 'pc' && (errorMessage.includes('Ollama') || errorMessage.includes('conectar') || errorMessage.includes('CORS'))) {
-        displayError = `💻 ${errorMessage}`;
-      } else {
-        displayError = `Lo siento, hubo un error: ${errorMessage} 😔`;
+      let displayError = `Lo siento, hubo un error: ${errorMessage} 😔`;
+      
+      // Si es error de conexión en modo PC, sugerir verificar Ollama
+      if (settings.mode === 'pc' && !ollamaAvailable) {
+        displayError += '\n\n💡 Tip: Ollama no está detectado. Verifica que esté corriendo con: OLLAMA_ORIGINS=* ollama serve';
       }
       
       await addMessage('assistant', displayError);
@@ -353,10 +334,13 @@ CREATE TABLE memories (
           <div 
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full ${modeInfo.bgColor}`}
             title={
-              modeInfo.status === 'connected' ? 'Ollama conectado - listo para usar' :
-              modeInfo.status === 'disconnected' ? 'Ollama no detectado - verifica que esté corriendo' :
-              modeInfo.status === 'checking' ? 'Verificando conexión...' :
-              'Modo Nube activo'
+              modeInfo.status === 'connected' 
+                ? `Modo híbrido activo - Ollama comprime, GPT-5.2 responde. Tokens ahorrados: ~${tokensSaved}` 
+                : modeInfo.status === 'disconnected' 
+                ? 'Ollama no detectado - usando modo Cloud directo' 
+                : modeInfo.status === 'checking' 
+                ? 'Verificando conexión con Ollama...' 
+                : 'Modo Cloud - GPT-5.2 directo'
             }
           >
             <span className={`w-2 h-2 rounded-full ${modeInfo.dotColor} ${modeInfo.status !== 'disconnected' ? 'animate-pulse' : ''}`}></span>
@@ -364,6 +348,9 @@ CREATE TABLE memories (
             <span className={`text-xs font-medium ${modeInfo.color}`}>{modeInfo.label}</span>
             {modeInfo.status === 'connected' && <Wifi size={12} className="text-blue-500" />}
             {modeInfo.status === 'disconnected' && <WifiOff size={12} className="text-orange-500" />}
+            {settings.mode === 'pc' && tokensSaved > 0 && (
+              <span className="text-[10px] text-green-500 ml-1">-{tokensSaved}tk</span>
+            )}
           </div>
         </div>
       </div>
