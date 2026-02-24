@@ -1,94 +1,16 @@
 /**
- * Cliente de Ollama para llamadas directas desde el navegador
- * Esto permite que el modo PC funcione desde cualquier deployment (Vercel, Abacus, etc.)
- * ya que la llamada se hace directamente desde tu Mac al Ollama local
+ * Cliente de Ollama para PRE-PROCESAMIENTO local
+ * 
+ * ARQUITECTURA HÍBRIDA:
+ * - Kaede SIEMPRE es GPT-5.2 (su mente/personalidad)
+ * - Ollama es solo un "cuerpo" que pre-procesa y resume contexto
+ * - Esto ahorra tokens al enviar contexto comprimido a GPT-5.2
+ * 
+ * MODO CLOUD: Usuario → GPT-5.2 (contexto completo)
+ * MODO PC:    Usuario → Ollama (resume) → GPT-5.2 (contexto comprimido)
  */
 
 import { Memory, Message } from './database.types';
-import { KAEDE_SYSTEM_PROMPT } from './constants';
-
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-}
-
-/**
- * Construye el contexto con memorias (versión cliente)
- */
-export function buildClientContext(
-  memories: Memory[],
-  bufferMessages: Message[],
-  maxTokens: number = 4000
-): ChatMessage[] {
-  const messages: ChatMessage[] = [];
-  
-  // Start with system prompt
-  let systemContent = KAEDE_SYSTEM_PROMPT;
-  
-  // Add core memories (Nunca olvidar)
-  const coreMemories = memories?.filter(m => m?.type === 'core') ?? [];
-  if (coreMemories?.length > 0) {
-    systemContent += '\n\n## Recuerdos Críticos (Nunca olvidar):\n';
-    coreMemories.forEach(m => {
-      systemContent += `- ${m?.content ?? ''}\n`;
-    });
-  }
-  
-  // Add identity memories
-  const identityMemories = memories?.filter(m => m?.type === 'identity')
-    ?.sort((a, b) => new Date(b?.last_used_at ?? 0).getTime() - new Date(a?.last_used_at ?? 0).getTime())
-    ?.slice(0, 10) ?? [];
-  if (identityMemories?.length > 0) {
-    systemContent += '\n\n## Identidad y conocimientos sobre el usuario:\n';
-    identityMemories.forEach(m => {
-      systemContent += `- ${m?.content ?? ''}\n`;
-    });
-  }
-  
-  // Add recent experience memories
-  const experienceMemories = memories?.filter(m => m?.type === 'experience')
-    ?.sort((a, b) => new Date(b?.last_used_at ?? 0).getTime() - new Date(a?.last_used_at ?? 0).getTime())
-    ?.slice(0, 5) ?? [];
-  if (experienceMemories?.length > 0) {
-    systemContent += '\n\n## Experiencias recientes:\n';
-    experienceMemories.forEach(m => {
-      systemContent += `- ${m?.content ?? ''}\n`;
-    });
-  }
-  
-  messages.push({ role: 'system', content: systemContent });
-  
-  // Add buffer messages (conversation history)
-  const sortedBuffer = [...(bufferMessages ?? [])].sort(
-    (a, b) => new Date(a?.created_at ?? 0).getTime() - new Date(b?.created_at ?? 0).getTime()
-  );
-  
-  // Estimate tokens and limit if needed
-  let estimatedTokens = systemContent?.length / 4;
-  const maxBufferTokens = maxTokens - estimatedTokens - 500;
-  
-  let bufferTokens = 0;
-  const messagesToInclude: Message[] = [];
-  
-  for (let i = sortedBuffer.length - 1; i >= 0; i--) {
-    const msg = sortedBuffer[i];
-    const msgTokens = (msg?.content?.length ?? 0) / 4;
-    if (bufferTokens + msgTokens > maxBufferTokens) break;
-    bufferTokens += msgTokens;
-    messagesToInclude.unshift(msg);
-  }
-  
-  messagesToInclude.forEach(msg => {
-    if (msg?.role && msg?.content) {
-      messages.push({
-        role: msg.role as 'user' | 'assistant',
-        content: msg.content,
-      });
-    }
-  });
-  
-  return messages;
-}
 
 /**
  * Verifica si Ollama está disponible localmente
@@ -97,7 +19,7 @@ export async function checkOllamaAvailable(ollamaUrl: string): Promise<boolean> 
   try {
     const response = await fetch(`${ollamaUrl}/api/tags`, {
       method: 'GET',
-      signal: AbortSignal.timeout(3000), // 3 second timeout
+      signal: AbortSignal.timeout(3000),
     });
     return response.ok;
   } catch {
@@ -106,79 +28,127 @@ export async function checkOllamaAvailable(ollamaUrl: string): Promise<boolean> 
 }
 
 /**
- * Llama a Ollama directamente desde el navegador
- * Retorna un ReadableStream para streaming
+ * PROMPT para que Ollama resuma el contexto de conversación
+ * Ollama actúa como "compresor" - extrae lo esencial para enviar a GPT-5.2
  */
-export async function callOllamaDirectly(
-  ollamaUrl: string,
-  model: string,
-  messages: ChatMessage[],
-  temperature: number = 0.8
-): Promise<Response> {
-  // Ollama tiene API compatible con OpenAI
-  const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: messages,
-      stream: true,
-      temperature: temperature,
-    }),
-  });
+const CONTEXT_COMPRESSION_PROMPT = `Eres un asistente de compresión de contexto. Tu trabajo es resumir conversaciones y memorias para optimizar tokens.
 
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error(`Modelo '${model}' no encontrado. Descárgalo con: ollama pull ${model}`);
-    }
-    throw new Error('No se pudo conectar con Ollama');
-  }
+INSTRUCCIONES:
+1. Resume la conversación manteniendo: nombres, fechas, decisiones, emociones clave
+2. Preserva información personal del usuario (gustos, datos, contexto importante)
+3. Elimina redundancias y frases de cortesía
+4. Mantén el tono y contexto emocional
+5. El resumen debe ser conciso pero completo
 
-  return response;
-}
+Responde SOLO con el resumen, sin explicaciones adicionales.`;
 
 /**
- * Procesa el stream de Ollama y retorna el contenido completo
+ * Usa Ollama para comprimir el historial de conversación
+ * Esto reduce tokens enviados a GPT-5.2
  */
-export async function processOllamaStream(
-  response: Response,
-  onChunk: (content: string) => void
-): Promise<string> {
-  const reader = response.body?.getReader();
-  const decoder = new TextDecoder();
-  let fullContent = '';
-
-  if (!reader) {
-    throw new Error('No se pudo leer la respuesta de Ollama');
+export async function compressContextWithOllama(
+  ollamaUrl: string,
+  ollamaModel: string,
+  memories: Memory[],
+  recentMessages: Message[],
+  currentMessage: string,
+  fileContent?: string
+): Promise<{ compressedContext: string; tokensSaved: number }> {
+  
+  // Construir el contexto a comprimir
+  let contextToCompress = '';
+  
+  // Agregar memorias
+  const coreMemories = memories?.filter(m => m?.type === 'core') ?? [];
+  const identityMemories = memories?.filter(m => m?.type === 'identity')?.slice(0, 10) ?? [];
+  const experienceMemories = memories?.filter(m => m?.type === 'experience')?.slice(0, 5) ?? [];
+  
+  if (coreMemories.length > 0) {
+    contextToCompress += '## Memorias críticas:\n';
+    coreMemories.forEach(m => contextToCompress += `- ${m.content}\n`);
   }
+  
+  if (identityMemories.length > 0) {
+    contextToCompress += '\n## Sobre el usuario:\n';
+    identityMemories.forEach(m => contextToCompress += `- ${m.content}\n`);
+  }
+  
+  if (experienceMemories.length > 0) {
+    contextToCompress += '\n## Experiencias recientes:\n';
+    experienceMemories.forEach(m => contextToCompress += `- ${m.content}\n`);
+  }
+  
+  // Agregar mensajes recientes (últimos 20)
+  const sortedMessages = [...(recentMessages ?? [])]
+    .sort((a, b) => new Date(a.created_at ?? 0).getTime() - new Date(b.created_at ?? 0).getTime())
+    .slice(-20);
+  
+  if (sortedMessages.length > 0) {
+    contextToCompress += '\n## Conversación reciente:\n';
+    sortedMessages.forEach(msg => {
+      const role = msg.role === 'user' ? 'Usuario' : 'Kaede';
+      // Truncar mensajes muy largos
+      const content = msg.content.length > 500 ? msg.content.slice(0, 500) + '...' : msg.content;
+      contextToCompress += `${role}: ${content}\n`;
+    });
+  }
+  
+  // Agregar archivo si existe
+  if (fileContent) {
+    const truncatedFile = fileContent.length > 2000 ? fileContent.slice(0, 2000) + '...[truncado]' : fileContent;
+    contextToCompress += `\n## Archivo adjunto:\n${truncatedFile}\n`;
+  }
+  
+  // Agregar mensaje actual
+  contextToCompress += `\n## Mensaje actual del usuario:\n${currentMessage}`;
+  
+  const originalLength = contextToCompress.length;
+  
+  // Si el contexto es pequeño, no vale la pena comprimir
+  if (originalLength < 1000) {
+    return {
+      compressedContext: contextToCompress,
+      tokensSaved: 0
+    };
+  }
+  
+  try {
+    // Llamar a Ollama para comprimir
+    const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        messages: [
+          { role: 'system', content: CONTEXT_COMPRESSION_PROMPT },
+          { role: 'user', content: `Resume este contexto de conversación:\n\n${contextToCompress}` }
+        ],
+        stream: false,
+        temperature: 0.3, // Baja temperatura para resumen preciso
+      }),
+    });
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const chunk = decoder.decode(value, { stream: true });
-    const lines = chunk.split('\n');
-
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        const data = line.slice(6);
-        if (data === '[DONE]') continue;
-
-        try {
-          const parsed = JSON.parse(data);
-          const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
-          if (deltaContent) {
-            fullContent += deltaContent;
-            onChunk(fullContent);
-          }
-        } catch {
-          // Skip invalid JSON
-        }
-      }
+    if (!response.ok) {
+      throw new Error('Ollama no respondió');
     }
-  }
 
-  return fullContent;
+    const data = await response.json();
+    const compressedContext = data?.choices?.[0]?.message?.content ?? contextToCompress;
+    
+    const compressedLength = compressedContext.length;
+    const tokensSaved = Math.round((originalLength - compressedLength) / 4); // Estimación de tokens
+    
+    return {
+      compressedContext: compressedContext + `\n\n[Mensaje actual: ${currentMessage}]`,
+      tokensSaved: Math.max(0, tokensSaved)
+    };
+    
+  } catch (error) {
+    console.error('Error comprimiendo con Ollama:', error);
+    // Si falla, devolver contexto original
+    return {
+      compressedContext: contextToCompress,
+      tokensSaved: 0
+    };
+  }
 }
