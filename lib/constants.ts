@@ -50,8 +50,8 @@ export const OLLAMA_MODELS = [
 
 // Cloud models available
 export const CLOUD_MODELS = [
-  { value: 'gpt-4o', label: 'GPT-4o (Recomendado)' },
+  { value: 'gpt-5.2', label: 'GPT-5.2 (Recomendado)' },
+  { value: 'gpt-4o', label: 'GPT-4o' },
   { value: 'gpt-4o-mini', label: 'GPT-4o Mini (Económico)' },
-  { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
-  { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo' },
+  { value: 'GPT-4 Turbo', label: 'GPT-4 Turbo' },
 ];
