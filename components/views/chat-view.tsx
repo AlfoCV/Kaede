@@ -8,17 +8,26 @@ import { useMessages, useSavedNotes, useMemories, resetTableCheck } from '@/hook
 import { useSettings } from '@/hooks/use-settings';
 import { useVoice } from '@/hooks/use-voice';
 import { Message } from '@/lib/database.types';
-import { AlertCircle, ExternalLink, RefreshCw, Cloud, Monitor, Volume2, VolumeX } from 'lucide-react';
+import { buildClientContext, callOllamaDirectly, processOllamaStream, checkOllamaAvailable } from '@/lib/ollama-client';
+import { AlertCircle, ExternalLink, RefreshCw, Cloud, Monitor, Volume2, VolumeX, Wifi, WifiOff } from 'lucide-react';
 
 export default function ChatView() {
   const { messages, addMessage, error } = useMessages();
   const { saveNote } = useSavedNotes();
-  const { addMemory } = useMemories();
+  const { memories, addMemory } = useMemories();
   const { settings, getCurrentModel, isLoaded, triggerHaptic } = useSettings();
   const { speak, stopSpeaking, isSpeaking, ttsSupported } = useVoice();
   const [isTyping, setIsTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
+  const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Check Ollama availability when in PC mode
+  useEffect(() => {
+    if (settings.mode === 'pc' && isLoaded) {
+      checkOllamaAvailable(settings.ollamaUrl).then(setOllamaAvailable);
+    }
+  }, [settings.mode, settings.ollamaUrl, isLoaded]);
 
   const scrollToBottom = () => {
     messagesEndRef?.current?.scrollIntoView?.({ behavior: 'smooth' });
@@ -42,60 +51,107 @@ export default function ChatView() {
 
     try {
       const currentModel = getCurrentModel();
-      
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: content,
-          maxTokens: settings.maxTokens,
-          temperature: settings.temperature,
-          model: currentModel,
-          mode: settings.mode,
-          ollamaUrl: settings.ollamaUrl,
-          fileContent: fileContent,
-        }),
-      });
-
-      // Handle non-streaming error responses
-      if (!response?.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Error desconocido' }));
-        throw new Error(errorData.error || 'Failed to get response');
-      }
-
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
       let fullContent = '';
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+      // Prepare user message with file content if any
+      const userMessage = fileContent 
+        ? `[Archivo adjunto]\n\nContenido del archivo:\n${fileContent}\n\n---\n\nMensaje del usuario: ${content}`
+        : content;
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
+      // === MODO PC: Llamada directa a Ollama desde el navegador ===
+      if (settings.mode === 'pc') {
+        // Build context with memories (from Supabase) + buffer messages
+        const contextMessages = buildClientContext(
+          memories ?? [],
+          messages ?? [],
+          settings.maxTokens
+        );
+        
+        // Add the new user message
+        contextMessages.push({ role: 'user', content: userMessage });
 
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-              
-              try {
-                const parsed = JSON.parse(data);
-                const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
-                if (deltaContent) {
-                  fullContent += deltaContent;
-                  setStreamingContent(fullContent);
+        try {
+          // Call Ollama directly from the browser
+          const response = await callOllamaDirectly(
+            settings.ollamaUrl,
+            currentModel,
+            contextMessages,
+            settings.temperature
+          );
+
+          // Process streaming response
+          fullContent = await processOllamaStream(response, (chunk) => {
+            setStreamingContent(chunk);
+          });
+        } catch (ollamaError: unknown) {
+          const errorMsg = ollamaError instanceof Error ? ollamaError.message : 'Error desconocido';
+          
+          // Check if it's a connection error (CORS or network)
+          if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
+            throw new Error(
+              'No se puede conectar con Ollama. Asegúrate de:\n' +
+              '1. Ollama está corriendo: ollama serve\n' +
+              '2. CORS habilitado: OLLAMA_ORIGINS=* ollama serve\n' +
+              '3. Estás en tu Mac local'
+            );
+          }
+          throw ollamaError;
+        }
+      } 
+      // === MODO CLOUD: Usa el API route (Vercel/Abacus → OpenAI) ===
+      else {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: content,
+            maxTokens: settings.maxTokens,
+            temperature: settings.temperature,
+            model: currentModel,
+            mode: 'cloud',
+            fileContent: fileContent,
+          }),
+        });
+
+        // Handle non-streaming error responses
+        if (!response?.ok) {
+          const errorData = await response.json().catch(() => ({ error: 'Error desconocido' }));
+          throw new Error(errorData.error || 'Failed to get response');
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data === '[DONE]') continue;
+                
+                try {
+                  const parsed = JSON.parse(data);
+                  const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
+                  if (deltaContent) {
+                    fullContent += deltaContent;
+                    setStreamingContent(fullContent);
+                  }
+                } catch {
+                  // Skip invalid JSON
                 }
-              } catch {
-                // Skip invalid JSON
               }
             }
           }
         }
       }
 
-      // Add assistant message to database
+      // Add assistant message to database (Supabase - shared between modes)
       if (fullContent) {
         await addMessage('assistant', fullContent);
         
@@ -122,8 +178,8 @@ export default function ChatView() {
       const errorMessage = err instanceof Error ? err.message : 'Error desconocido';
       
       let displayError = errorMessage;
-      if (settings.mode === 'pc' && (errorMessage.includes('Ollama') || errorMessage.includes('conectar'))) {
-        displayError = `💻 ${errorMessage}\n\n¿Necesitas ayuda? Ve a Ajustes para ver las instrucciones de configuración de Ollama.`;
+      if (settings.mode === 'pc' && (errorMessage.includes('Ollama') || errorMessage.includes('conectar') || errorMessage.includes('CORS'))) {
+        displayError = `💻 ${errorMessage}`;
       } else {
         displayError = `Lo siento, hubo un error: ${errorMessage} 😔`;
       }
@@ -164,9 +220,26 @@ export default function ChatView() {
   const displayMessages = [...(messages ?? [])];
 
   // Mode indicator info
-  const modeInfo = isLoaded && settings.mode === 'pc'
-    ? { icon: Monitor, label: 'PC', color: 'text-blue-500', bgColor: 'bg-blue-500/10', dotColor: 'bg-blue-500' }
-    : { icon: Cloud, label: 'Nube', color: 'text-[var(--color-success)]', bgColor: 'bg-[var(--color-success)]/10', dotColor: 'bg-[var(--color-success)]' };
+  const getModeInfo = () => {
+    if (!isLoaded) {
+      return { icon: Cloud, label: 'Cargando...', color: 'text-gray-400', bgColor: 'bg-gray-400/10', dotColor: 'bg-gray-400', status: null };
+    }
+    
+    if (settings.mode === 'pc') {
+      // PC mode with Ollama status
+      if (ollamaAvailable === null) {
+        return { icon: Monitor, label: 'PC', color: 'text-blue-500', bgColor: 'bg-blue-500/10', dotColor: 'bg-blue-500', status: 'checking' };
+      } else if (ollamaAvailable) {
+        return { icon: Monitor, label: 'PC', color: 'text-blue-500', bgColor: 'bg-blue-500/10', dotColor: 'bg-blue-500', status: 'connected', statusIcon: Wifi };
+      } else {
+        return { icon: Monitor, label: 'PC', color: 'text-orange-500', bgColor: 'bg-orange-500/10', dotColor: 'bg-orange-500', status: 'disconnected', statusIcon: WifiOff };
+      }
+    }
+    
+    return { icon: Cloud, label: 'Nube', color: 'text-[var(--color-success)]', bgColor: 'bg-[var(--color-success)]/10', dotColor: 'bg-[var(--color-success)]', status: null };
+  };
+  
+  const modeInfo = getModeInfo();
 
   // Show setup instructions if tables don't exist
   if (error === 'tables_not_created') {
@@ -277,10 +350,20 @@ CREATE TABLE memories (
             </button>
           )}
           {/* Mode badge */}
-          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full ${modeInfo.bgColor}`}>
-            <span className={`w-2 h-2 rounded-full ${modeInfo.dotColor} animate-pulse`}></span>
+          <div 
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full ${modeInfo.bgColor}`}
+            title={
+              modeInfo.status === 'connected' ? 'Ollama conectado - listo para usar' :
+              modeInfo.status === 'disconnected' ? 'Ollama no detectado - verifica que esté corriendo' :
+              modeInfo.status === 'checking' ? 'Verificando conexión...' :
+              'Modo Nube activo'
+            }
+          >
+            <span className={`w-2 h-2 rounded-full ${modeInfo.dotColor} ${modeInfo.status !== 'disconnected' ? 'animate-pulse' : ''}`}></span>
             <modeInfo.icon size={14} className={modeInfo.color} />
             <span className={`text-xs font-medium ${modeInfo.color}`}>{modeInfo.label}</span>
+            {modeInfo.status === 'connected' && <Wifi size={12} className="text-blue-500" />}
+            {modeInfo.status === 'disconnected' && <WifiOff size={12} className="text-orange-500" />}
           </div>
         </div>
       </div>
