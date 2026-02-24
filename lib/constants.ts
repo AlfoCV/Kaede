@@ -17,6 +17,7 @@ export const DEFAULT_SETTINGS = {
   cloudModel: 'gpt-5.2',
   ollamaUrl: 'http://localhost:11434',
   ollamaModel: 'llama3.2',
+  bridgeUrl: '', // URL del Kaede Bridge (vacío = usar /api/ollama local)
   theme: 'light' as const,
   voice: {
     ttsEnabled: false,
