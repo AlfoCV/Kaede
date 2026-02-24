@@ -22,6 +22,7 @@ export interface Settings {
   cloudModel: string;
   ollamaUrl: string;
   ollamaModel: string;
+  bridgeUrl: string; // URL del Kaede Bridge (ej: http://192.168.x.x:5001)
   voice: VoiceSettings;
 }
 
@@ -134,3 +135,4 @@ export function useSettings() {
     getEffectiveTheme,
   };
 }
+
