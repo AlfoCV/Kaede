@@ -1,271 +1,419 @@
 "use client";
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Paperclip, Mic, MicOff, X, FileText, Image as ImageIcon, File, StopCircle } from 'lucide-react';
+import MessageBubble from '@/components/message-bubble';
+import ChatInput from '@/components/chat-input';
+import TypingIndicator from '@/components/typing-indicator';
+import { useMessages, useSavedNotes, useMemories, resetTableCheck } from '@/hooks/use-supabase';
 import { useSettings } from '@/hooks/use-settings';
 import { useVoice } from '@/hooks/use-voice';
+import { Message } from '@/lib/database.types';
+import { checkOllamaAvailable, compressContextWithOllama } from '@/lib/ollama-client';
+import { AlertCircle, ExternalLink, RefreshCw, Cloud, Monitor, Volume2, VolumeX, Wifi, WifiOff } from 'lucide-react';
 
-interface FileAttachment {
-  name: string;
-  type: string;
-  content: string;
-  size: number;
-}
+export default function ChatView() {
+  const { messages, addMessage, error } = useMessages();
+  const { saveNote } = useSavedNotes();
+  const { memories, addMemory } = useMemories();
+  const { settings, getCurrentModel, isLoaded, triggerHaptic } = useSettings();
+  const { speak, stopSpeaking, isSpeaking, ttsSupported } = useVoice();
+  const [isTyping, setIsTyping] = useState(false);
+  const [streamingContent, setStreamingContent] = useState('');
+  const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
+  const [tokensSaved, setTokensSaved] = useState<number>(0);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-interface ChatInputProps {
-  onSend: (message: string, fileContent?: string) => void;
-  disabled?: boolean;
-}
-
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-
-export default function ChatInput({ onSend, disabled }: ChatInputProps) {
-  const [message, setMessage] = useState('');
-  const [attachment, setAttachment] = useState<FileAttachment | null>(null);
-  const [isProcessingFile, setIsProcessingFile] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const { settings, triggerHaptic } = useSettings();
-  const {
-    isListening,
-    transcript,
-    startListening,
-    stopListening,
-    resetTranscript,
-    sttSupported,
-  } = useVoice();
-
-  // Update message when transcript changes
+  // Check Ollama/Bridge availability when in PC mode
   useEffect(() => {
-    if (transcript) {
-      setMessage((prev) => prev + transcript);
-      resetTranscript();
+    if (settings.mode === 'pc' && isLoaded) {
+      checkOllamaAvailable(settings.ollamaUrl, settings.bridgeUrl).then(setOllamaAvailable);
+    } else {
+      setOllamaAvailable(null);
     }
-  }, [transcript, resetTranscript]);
+  }, [settings.mode, settings.ollamaUrl, settings.bridgeUrl, isLoaded]);
 
-  const handleSubmit = () => {
-    const trimmedMessage = message.trim();
-    if (!trimmedMessage && !attachment) return;
-    
-    triggerHaptic(50);
-    onSend(trimmedMessage || 'Analiza este archivo', attachment?.content);
-    setMessage('');
-    setAttachment(null);
-    
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-    }
+  const scrollToBottom = () => {
+    messagesEndRef?.current?.scrollIntoView?.({ behavior: 'smooth' });
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
-    }
-  };
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, streamingContent]);
 
-  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setMessage(e.target.value);
-    // Auto-resize
-    const textarea = e.target;
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
-  };
-
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    // Reset input
-    e.target.value = '';
-
-    // Check file size
-    if (file.size > MAX_FILE_SIZE) {
-      alert('El archivo es demasiado grande. Máximo 5MB.');
-      return;
+  const handleSendMessage = async (content: string, fileContent?: string) => {
+    // Stop any ongoing speech
+    if (isSpeaking) {
+      stopSpeaking();
     }
 
-    setIsProcessingFile(true);
-    triggerHaptic(30);
+    // Add user message (with file indicator if attached)
+    const displayContent = fileContent ? `${content}\n\n📎 Archivo adjunto` : content;
+    await addMessage('user', displayContent);
+    setIsTyping(true);
+    setStreamingContent('');
 
     try {
-      let content = '';
+      let fullContent = '';
+      let compressedContext: string | undefined;
+      let saved = 0;
 
-      if (file.type === 'application/pdf') {
-        content = `[Este es un archivo PDF: ${file.name}]\n\nNota: El procesamiento de PDFs requiere extracción de texto. Por favor, copia el contenido del PDF y pégalo directamente en el chat para mejor procesamiento.`;
-      } else if (file.type.startsWith('image/')) {
-        content = await readFileAsDataURL(file);
-        content = `[Imagen adjunta: ${file.name}]\n\n${content}`;
-      } else {
-        content = await readFileAsText(file);
+      // === MODO PC: Pre-procesar con Ollama/Bridge, luego GPT-5.2 ===
+      if (settings.mode === 'pc' && ollamaAvailable) {
+        try {
+          // Paso 1: Ollama comprime el contexto (vía bridge si está configurado)
+          const compression = await compressContextWithOllama(
+            settings.ollamaUrl,
+            settings.ollamaModel,
+            memories ?? [],
+            messages ?? [],
+            content,
+            fileContent,
+            settings.bridgeUrl
+          );
+          
+          compressedContext = compression.compressedContext;
+          saved = compression.tokensSaved;
+          setTokensSaved(prev => prev + saved);
+          
+        } catch (ollamaError) {
+          console.warn('Ollama compression failed, using full context:', ollamaError);
+          // Si Ollama falla, continuar sin comprimir
+        }
       }
 
-      setAttachment({
-        name: file.name,
-        type: file.type,
-        content,
-        size: file.size,
+      // === AMBOS MODOS: Enviar a GPT-5.2 (siempre es el cerebro de Kaede) ===
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: content,
+          maxTokens: settings.maxTokens,
+          temperature: settings.temperature,
+          model: settings.cloudModel, // Siempre GPT-5.2
+          mode: 'cloud', // Siempre cloud porque GPT-5.2 es el cerebro
+          fileContent: fileContent,
+          // En modo PC, enviar contexto comprimido
+          compressedContext: compressedContext,
+        }),
       });
-    } catch (error) {
-      console.error('Error reading file:', error);
-      alert('Error al leer el archivo.');
+
+      // Handle non-streaming error responses
+      if (!response?.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Error desconocido' }));
+        throw new Error(errorData.error || 'Failed to get response');
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+              
+              try {
+                const parsed = JSON.parse(data);
+                const deltaContent = parsed?.choices?.[0]?.delta?.content ?? '';
+                if (deltaContent) {
+                  fullContent += deltaContent;
+                  setStreamingContent(fullContent);
+                }
+              } catch {
+                // Skip invalid JSON
+              }
+            }
+          }
+        }
+      }
+
+      // Add assistant message to database (Supabase - shared between modes)
+      if (fullContent) {
+        await addMessage('assistant', fullContent);
+        
+        // Auto TTS if enabled
+        if (settings.voice?.ttsEnabled && ttsSupported) {
+          const cleanContent = fullContent
+            .replace(/[\u{1F600}-\u{1F64F}]/gu, '')
+            .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')
+            .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')
+            .replace(/[\u{2600}-\u{26FF}]/gu, '')
+            .replace(/```[\s\S]*?```/g, 'bloque de código')
+            .replace(/\*\*(.*?)\*\*/g, '$1')
+            .replace(/\*(.*?)\*/g, '$1')
+            .trim();
+          
+          if (cleanContent) {
+            speak(cleanContent);
+          }
+        }
+      }
+    } catch (err: unknown) {
+      console.error('Chat error:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Error desconocido';
+      
+      let displayError = `Lo siento, hubo un error: ${errorMessage} 😔`;
+      
+      // Si es error de conexión en modo PC, sugerir verificar Ollama
+      if (settings.mode === 'pc' && !ollamaAvailable) {
+        displayError += '\n\n💡 Tip: Ollama no está detectado. Verifica que esté corriendo con: OLLAMA_ORIGINS=* ollama serve';
+      }
+      
+      await addMessage('assistant', displayError);
+    } finally {
+      setIsTyping(false);
+      setStreamingContent('');
     }
-
-    setIsProcessingFile(false);
   };
 
-  const readFileAsText = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target?.result as string);
-      reader.onerror = reject;
-      reader.readAsText(file);
-    });
+  const handleSaveNote = async (messageId: string, content: string) => {
+    await saveNote(messageId, content);
   };
 
-  const readFileAsDataURL = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target?.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
+  const handleSaveFavorite = async (messageId: string, content: string) => {
+    await addMemory(content, 'identity', 3);
   };
 
-  const removeAttachment = () => {
+  const handleSpeakMessage = (content: string) => {
     triggerHaptic(30);
-    setAttachment(null);
-  };
-
-  const getFileIcon = (type: string) => {
-    if (type.startsWith('image/')) return ImageIcon;
-    if (type === 'application/pdf' || type.includes('text')) return FileText;
-    return File;
-  };
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  };
-
-  const handleVoiceToggle = () => {
-    triggerHaptic(30);
-    if (isListening) {
-      stopListening();
+    if (isSpeaking) {
+      stopSpeaking();
     } else {
-      startListening();
+      const cleanContent = content
+        .replace(/[\u{1F600}-\u{1F64F}]/gu, '')
+        .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')
+        .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')
+        .replace(/[\u{2600}-\u{26FF}]/gu, '')
+        .replace(/```[\s\S]*?```/g, 'bloque de código')
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        .replace(/\*(.*?)\*/g, '$1')
+        .trim();
+      speak(cleanContent);
     }
   };
 
-  const voiceEnabled = settings.voice?.sttEnabled && sttSupported;
+  const displayMessages = [...(messages ?? [])];
+
+  // Mode indicator info
+  const getModeInfo = () => {
+    if (!isLoaded) {
+      return { icon: Cloud, label: 'Cargando...', color: 'text-gray-400', bgColor: 'bg-gray-400/10', dotColor: 'bg-gray-400', status: null };
+    }
+    
+    if (settings.mode === 'pc') {
+      // PC mode with Ollama status
+      if (ollamaAvailable === null) {
+        return { icon: Monitor, label: 'PC', color: 'text-blue-500', bgColor: 'bg-blue-500/10', dotColor: 'bg-blue-500', status: 'checking' };
+      } else if (ollamaAvailable) {
+        return { icon: Monitor, label: 'PC', color: 'text-blue-500', bgColor: 'bg-blue-500/10', dotColor: 'bg-blue-500', status: 'connected', statusIcon: Wifi };
+      } else {
+        return { icon: Monitor, label: 'PC', color: 'text-orange-500', bgColor: 'bg-orange-500/10', dotColor: 'bg-orange-500', status: 'disconnected', statusIcon: WifiOff };
+      }
+    }
+    
+    return { icon: Cloud, label: 'Nube', color: 'text-[var(--color-success)]', bgColor: 'bg-[var(--color-success)]/10', dotColor: 'bg-[var(--color-success)]', status: null };
+  };
+  
+  const modeInfo = getModeInfo();
+
+  // Show setup instructions if tables don't exist
+  if (error === 'tables_not_created') {
+    return (
+      <div className="flex flex-col h-full bg-[var(--color-background)]">
+        <div className="p-6 border-b border-[var(--color-border)]">
+          <h2 className="text-xl font-poppins font-semibold text-[var(--color-text-primary)]">
+            Configuración Requerida
+          </h2>
+        </div>
+        <div className="flex-1 flex items-center justify-center p-6">
+          <div className="max-w-lg bg-[var(--color-card)] rounded-2xl shadow-lg p-6 text-center">
+            <div className="w-16 h-16 bg-[var(--color-accent)]/10 rounded-full flex items-center justify-center mx-auto mb-4">
+              <AlertCircle className="text-[var(--color-accent)]" size={32} />
+            </div>
+            <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">
+              Base de datos no configurada
+            </h3>
+            <p className="text-[var(--color-text-secondary)] mb-4">
+              Las tablas necesarias aún no existen en Supabase. Por favor, ejecuta el siguiente SQL en el Editor SQL de tu proyecto Supabase:
+            </p>
+            <div className="bg-[var(--color-primary)] rounded-lg p-4 text-left mb-4 overflow-x-auto">
+              <code className="text-xs text-[var(--color-accent-soft)] whitespace-pre">
+{`-- Copia este SQL en Supabase SQL Editor
+
+CREATE TABLE messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id TEXT NOT NULL DEFAULT 'default_user',
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  is_in_buffer BOOLEAN DEFAULT true
+);
+
+CREATE TABLE saved_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id TEXT NOT NULL DEFAULT 'default_user',
+  message_id UUID,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE memories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id TEXT NOT NULL DEFAULT 'default_user',
+  type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  importance INTEGER DEFAULT 3,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  last_used_at TIMESTAMPTZ DEFAULT NOW(),
+  access_count INTEGER DEFAULT 0
+);`}
+              </code>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-3 justify-center">
+              <a
+                href="https://supabase.com/dashboard/project/gjdzqqfovrxtwraflwtn/sql/new"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center gap-2 px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg hover:opacity-90 transition-all"
+              >
+                <ExternalLink size={16} />
+                Abrir Supabase SQL Editor
+              </a>
+              <button
+                onClick={() => {
+                  resetTableCheck();
+                  window.location.reload();
+                }}
+                className="inline-flex items-center justify-center gap-2 px-4 py-2 bg-[var(--color-primary)] text-white rounded-lg hover:opacity-90 transition-all"
+              >
+                <RefreshCw size={16} />
+                Reintentar conexión
+              </button>
+            </div>
+            <p className="text-xs text-[var(--color-text-secondary)] mt-4">
+              Después de ejecutar el SQL, haz clic en &quot;Reintentar conexión&quot;.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="p-3 md:p-4 border-t border-[var(--color-border)] bg-[var(--color-background)]">
-      {/* Attachment Preview */}
-      {attachment && (
-        <div className="mb-3 p-3 bg-[var(--color-card)] rounded-lg border border-[var(--color-border)] flex items-center gap-3">
-          {(() => {
-            const FileIcon = getFileIcon(attachment.type);
-            return <FileIcon size={20} className="text-[var(--color-accent)]" />;
-          })()}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-[var(--color-text-primary)] truncate">{attachment.name}</p>
-            <p className="text-xs text-[var(--color-text-secondary)]">{formatFileSize(attachment.size)}</p>
+    <div className="flex flex-col h-full bg-[var(--color-background)]">
+      {/* Header */}
+      <div className="p-4 md:p-6 border-b border-[var(--color-border)] flex items-center justify-between">
+        <h2 className="text-lg md:text-xl font-poppins font-semibold text-[var(--color-text-primary)]">
+          Conversa con Kaede
+        </h2>
+        <div className="flex items-center gap-2">
+          {/* TTS indicator */}
+          {settings.voice?.ttsEnabled && ttsSupported && (
+            <button
+              onClick={() => {
+                triggerHaptic(30);
+                if (isSpeaking) stopSpeaking();
+              }}
+              className={`p-2 rounded-full transition-all ${
+                isSpeaking 
+                  ? 'bg-[var(--color-accent)]/10 text-[var(--color-accent)]' 
+                  : 'text-[var(--color-text-secondary)]'
+              }`}
+              title={isSpeaking ? 'Detener voz' : 'Voz activada'}
+            >
+              {isSpeaking ? <Volume2 size={18} className="animate-pulse" /> : <VolumeX size={18} />}
+            </button>
+          )}
+          {/* Mode badge */}
+          <div 
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full ${modeInfo.bgColor}`}
+            title={
+              modeInfo.status === 'connected' 
+                ? `Modo híbrido activo - Ollama comprime, GPT-5.2 responde. Tokens ahorrados: ~${tokensSaved}` 
+                : modeInfo.status === 'disconnected' 
+                ? 'Ollama no detectado - verifica que esté corriendo (ollama serve)'
+                : modeInfo.status === 'checking' 
+                ? 'Verificando conexión con Ollama...' 
+                : 'Modo Cloud - GPT-5.2 directo'
+            }
+          >
+            <span className={`w-2 h-2 rounded-full ${modeInfo.dotColor} ${modeInfo.status !== 'disconnected' ? 'animate-pulse' : ''}`}></span>
+            <modeInfo.icon size={14} className={modeInfo.color} />
+            <span className={`text-xs font-medium ${modeInfo.color}`}>{modeInfo.label}</span>
+            {modeInfo.status === 'connected' && <Wifi size={12} className="text-blue-500" />}
+            {modeInfo.status === 'disconnected' && <WifiOff size={12} className="text-orange-500" />}
+            {settings.mode === 'pc' && tokensSaved > 0 && (
+              <span className="text-[10px] text-green-500 ml-1">-{tokensSaved}tk</span>
+            )}
           </div>
-          <button
-            onClick={removeAttachment}
-            className="p-1.5 hover:bg-[var(--color-accent)]/10 rounded-full transition-colors"
-          >
-            <X size={16} className="text-[var(--color-text-secondary)]" />
-          </button>
         </div>
-      )}
-
-      {/* Listening Indicator */}
-      {isListening && (
-        <div className="mb-3 p-3 bg-[var(--color-accent)]/10 rounded-lg border border-[var(--color-accent)]/30 flex items-center gap-3">
-          <div className="w-3 h-3 bg-[var(--color-accent)] rounded-full recording-pulse" />
-          <p className="text-sm text-[var(--color-accent)] font-medium">Escuchando... habla ahora</p>
-          <button
-            onClick={stopListening}
-            className="ml-auto p-1.5 bg-[var(--color-accent)] text-white rounded-full hover:opacity-90"
-          >
-            <StopCircle size={16} />
-          </button>
-        </div>
-      )}
-
-      {/* Input Area */}
-      <div className="flex items-end gap-2">
-        {/* File Attachment Button */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".txt,.md,.csv,.json,.html,.css,.js,.py,.pdf,image/*"
-          onChange={handleFileSelect}
-          className="hidden"
-        />
-        <button
-          onClick={() => {
-            triggerHaptic(30);
-            fileInputRef.current?.click();
-          }}
-          disabled={disabled || isProcessingFile}
-          className="flex-shrink-0 p-2.5 md:p-3 text-[var(--color-text-secondary)] hover:text-[var(--color-accent)] hover:bg-[var(--color-accent)]/10 rounded-full transition-all disabled:opacity-50"
-          title="Adjuntar archivo"
-        >
-          <Paperclip size={20} className={isProcessingFile ? 'animate-pulse' : ''} />
-        </button>
-
-        {/* Text Input */}
-        <div className="flex-1 relative">
-          <textarea
-            ref={textareaRef}
-            value={message}
-            onChange={handleTextareaChange}
-            onKeyDown={handleKeyDown}
-            placeholder={attachment ? 'Añade un mensaje (opcional)...' : isListening ? 'Escuchando...' : 'Escribe un mensaje...'}
-            disabled={disabled}
-            rows={1}
-            className="w-full px-4 py-2.5 md:py-3 bg-[var(--color-input-bg)] rounded-2xl border border-[var(--color-border)] focus:border-[var(--color-accent)] outline-none resize-none text-[var(--color-text-primary)] text-sm md:text-base placeholder:text-[var(--color-text-secondary)]/60 disabled:opacity-50"
-            style={{ maxHeight: '150px' }}
-          />
-        </div>
-
-        {/* Voice Button */}
-        {voiceEnabled && (
-          <button
-            onClick={handleVoiceToggle}
-            disabled={disabled}
-            className={`flex-shrink-0 p-2.5 md:p-3 rounded-full transition-all disabled:opacity-50 ${
-              isListening
-                ? 'bg-[var(--color-accent)] text-white recording-pulse'
-                : 'text-[var(--color-text-secondary)] hover:text-[var(--color-accent)] hover:bg-[var(--color-accent)]/10'
-            }`}
-            title={isListening ? 'Detener grabación' : 'Mensaje de voz'}
-          >
-            {isListening ? <MicOff size={20} /> : <Mic size={20} />}
-          </button>
-        )}
-
-        {/* Send Button */}
-        <button
-          onClick={handleSubmit}
-          disabled={disabled || (!message.trim() && !attachment)}
-          className="flex-shrink-0 p-2.5 md:p-3 bg-[var(--color-accent)] text-white rounded-full hover:opacity-90 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Send size={20} />
-        </button>
       </div>
 
-      {/* Hints */}
-      <p className="text-[10px] text-[var(--color-text-secondary)]/60 mt-2 text-center">
-        {voiceEnabled 
-          ? 'Archivos: TXT, MD, CSV, JSON, HTML, CSS, JS, PY, PDF, Imágenes • 🎤 Voz activada'
-          : 'Archivos: TXT, MD, CSV, JSON, HTML, CSS, JS, PY, PDF, Imágenes (máx 5MB)'
-        }
-      </p>
+      {/* Messages Area */}
+      <div className="flex-1 overflow-y-auto p-4 md:p-6 pb-28 md:pb-24">
+        {displayMessages?.length === 0 && !isTyping && (
+          <div className="text-center py-12">
+            <p className="text-[var(--color-text-secondary)]">
+              ¡Hola! Soy Kaede. ¿En qué puedo ayudarte hoy? 💙
+            </p>
+            {settings.mode === 'pc' && (
+              <p className="text-xs text-[var(--color-text-secondary)]/60 mt-2">
+                Conectada a Ollama ({settings.ollamaModel})
+              </p>
+            )}
+            {settings.voice?.ttsEnabled && (
+              <p className="text-xs text-[var(--color-accent)] mt-2">
+                🔊 Voz activada
+              </p>
+            )}
+          </div>
+        )}
+
+        {displayMessages?.map?.((msg: Message) => (
+          <MessageBubble
+            key={msg?.id}
+            id={msg?.id ?? ''}
+            role={msg?.role ?? 'user'}
+            content={msg?.content ?? ''}
+            timestamp={msg?.created_at ?? ''}
+            onSaveNote={handleSaveNote}
+            onSaveFavorite={handleSaveFavorite}
+            onSpeak={settings.voice?.ttsEnabled && ttsSupported ? handleSpeakMessage : undefined}
+            isSpeaking={isSpeaking}
+          />
+        ))}
+
+        {/* Streaming message */}
+        {streamingContent && (
+          <MessageBubble
+            id="streaming"
+            role="assistant"
+            content={streamingContent}
+            timestamp={new Date().toISOString()}
+          />
+        )}
+
+        {/* Typing indicator */}
+        {isTyping && !streamingContent && (
+          <div className="flex justify-start mb-4">
+            <div className="bg-[var(--color-surface)] rounded-2xl px-4 py-3 shadow-md">
+              <TypingIndicator />
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input */}
+      <ChatInput onSend={handleSendMessage} disabled={isTyping} />
     </div>
   );
 }
