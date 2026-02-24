@@ -8,6 +8,12 @@ import { USER_ID, KAEDE_SYSTEM_PROMPT } from '@/lib/constants';
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
+/**
+ * ARQUITECTURA HÍBRIDA:
+ * - Kaede SIEMPRE usa GPT-5.2 (su mente/personalidad)
+ * - En modo PC, el contexto viene pre-comprimido por Ollama (ahorra tokens)
+ * - En modo Cloud, se construye el contexto completo aquí
+ */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -16,51 +22,64 @@ export async function POST(request: NextRequest) {
       maxTokens = 2000, 
       temperature = 0.8, 
       model = 'gpt-5.2',
-      mode = 'cloud',
-      ollamaUrl = 'http://localhost:11434',
-      fileContent = null // For file processing
+      fileContent = null,
+      // Contexto comprimido por Ollama (modo PC híbrido)
+      compressedContext = null
     } = body ?? {};
 
     if (!message) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 });
     }
 
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    let contextMessages: Array<{ role: string; content: string }>;
 
-    // Fetch memories for context
-    const { data: memories } = await supabase
-      .from('memories')
-      .select('*')
-      .eq('user_id', USER_ID)
-      .order('importance', { ascending: false })
-      .order('last_used_at', { ascending: false });
-
-    // Fetch buffer messages for context
-    const { data: bufferMessages } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('user_id', USER_ID)
-      .eq('is_in_buffer', true)
-      .order('created_at', { ascending: true });
-
-    // Build context with memories
-    const contextMessages = buildContext(memories ?? [], bufferMessages ?? [], maxTokens);
-
-    // Add file content if provided
-    let userMessage = message;
-    if (fileContent) {
-      userMessage = `[Archivo adjunto]\n\nContenido del archivo:\n${fileContent}\n\n---\n\nMensaje del usuario: ${message}`;
-    }
-
-    // Add the new user message
-    contextMessages.push({ role: 'user', content: userMessage });
-
-    // Route to appropriate API based on mode
-    if (mode === 'pc') {
-      return handleOllamaRequest(contextMessages, model, temperature, ollamaUrl);
+    // Si hay contexto comprimido (viene de modo PC con Ollama), usarlo
+    if (compressedContext) {
+      // Usar el contexto ya comprimido por Ollama
+      contextMessages = [
+        { 
+          role: 'system', 
+          content: KAEDE_SYSTEM_PROMPT + '\n\n## Contexto de la conversación (resumido):\n' + compressedContext 
+        }
+      ];
+      // El mensaje actual ya está incluido en compressedContext, pero lo agregamos explícitamente
+      contextMessages.push({ role: 'user', content: message });
     } else {
-      return handleCloudRequest(contextMessages, model, temperature, maxTokens);
+      // Modo Cloud: construir contexto completo desde Supabase
+      const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+      // Fetch memories for context
+      const { data: memories } = await supabase
+        .from('memories')
+        .select('*')
+        .eq('user_id', USER_ID)
+        .order('importance', { ascending: false })
+        .order('last_used_at', { ascending: false });
+
+      // Fetch buffer messages for context
+      const { data: bufferMessages } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('user_id', USER_ID)
+        .eq('is_in_buffer', true)
+        .order('created_at', { ascending: true });
+
+      // Build context with memories
+      contextMessages = buildContext(memories ?? [], bufferMessages ?? [], maxTokens);
+
+      // Add file content if provided
+      let userMessage = message;
+      if (fileContent) {
+        userMessage = `[Archivo adjunto]\n\nContenido del archivo:\n${fileContent}\n\n---\n\nMensaje del usuario: ${message}`;
+      }
+
+      // Add the new user message
+      contextMessages.push({ role: 'user', content: userMessage });
     }
+
+    // SIEMPRE usar GPT-5.2 - Kaede es GPT-5.2
+    return handleCloudRequest(contextMessages, model, temperature, maxTokens);
+    
   } catch (error) {
     console.error('Chat API error:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
@@ -104,60 +123,6 @@ async function handleCloudRequest(
   }
 
   return streamResponse(response);
-}
-
-// Handle PC Mode (Ollama)
-async function handleOllamaRequest(
-  contextMessages: Array<{ role: string; content: string }>,
-  model: string,
-  temperature: number,
-  ollamaUrl: string
-) {
-  try {
-    // Ollama uses OpenAI-compatible API
-    const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: contextMessages,
-        stream: true,
-        temperature: temperature,
-      }),
-    });
-
-    if (!response?.ok) {
-      const errorText = await response?.text?.();
-      console.error('Ollama API error:', errorText);
-      
-      // Return helpful error messages
-      if (response.status === 404) {
-        return NextResponse.json({ 
-          error: `Modelo '${model}' no encontrado. Asegúrate de haberlo descargado con: ollama pull ${model}` 
-        }, { status: 404 });
-      }
-      
-      return NextResponse.json({ 
-        error: 'No se pudo conectar con Ollama. Verifica que esté ejecutándose en tu Mac.' 
-      }, { status: 500 });
-    }
-
-    return streamResponse(response);
-  } catch (error: unknown) {
-    console.error('Ollama connection error:', error);
-    
-    // Check if it's a connection error
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('fetch failed')) {
-      return NextResponse.json({ 
-        error: 'No se pudo conectar con Ollama. Asegúrate de que:\n1. Ollama esté instalado\n2. El servicio esté corriendo (ollama serve)\n3. La URL sea correcta' 
-      }, { status: 503 });
-    }
-    
-    return NextResponse.json({ error: 'Error al conectar con Ollama' }, { status: 500 });
-  }
 }
 
 // Stream response helper
