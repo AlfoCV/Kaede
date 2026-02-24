@@ -14,15 +14,24 @@ import { Memory, Message } from './database.types';
 
 /**
  * Verifica si Ollama está disponible localmente
+ * Usa el endpoint raíz que tiene menos restricciones CORS
  */
 export async function checkOllamaAvailable(ollamaUrl: string): Promise<boolean> {
   try {
-    const response = await fetch(`${ollamaUrl}/api/tags`, {
+    // Usar endpoint raíz - más permisivo con CORS
+    const response = await fetch(ollamaUrl, {
       method: 'GET',
+      mode: 'cors',
       signal: AbortSignal.timeout(3000),
     });
-    return response.ok;
-  } catch {
+    // Ollama responde "Ollama is running" en el endpoint raíz
+    if (response.ok) {
+      const text = await response.text();
+      return text.includes('Ollama');
+    }
+    return false;
+  } catch (error) {
+    console.log('Ollama check failed:', error);
     return false;
   }
 }
