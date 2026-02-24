@@ -1,6 +1,6 @@
-nano next.config.jsconst path = require('path');
+const path = require('path');
 
-/** @type {import('next').NextConfig} */
+/ @type {import('next').NextConfig} /
 const nextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
