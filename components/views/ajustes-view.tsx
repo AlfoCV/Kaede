@@ -18,15 +18,31 @@ export default function AjustesView() {
   const [importResult, setImportResult] = useState<{ success: boolean; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Check Ollama connection status
+  // Check Ollama/Bridge connection status
   const checkOllamaConnection = async () => {
     setCheckingOllama(true);
     try {
-      const response = await fetch(`${settings.ollamaUrl}/api/tags`, {
+      // Si hay bridge URL configurado, verificar el bridge; si no, verificar Ollama directo
+      const targetUrl = settings.bridgeUrl 
+        ? `${settings.bridgeUrl}/health`
+        : `${settings.ollamaUrl}/api/tags`;
+      
+      const response = await fetch(targetUrl, {
         method: 'GET',
         signal: AbortSignal.timeout(5000),
       });
-      setOllamaStatus(response.ok ? 'connected' : 'disconnected');
+      
+      if (response.ok) {
+        const data = await response.json();
+        // El bridge devuelve { ollama: true/false }
+        if (settings.bridgeUrl) {
+          setOllamaStatus(data.ollama ? 'connected' : 'disconnected');
+        } else {
+          setOllamaStatus('connected');
+        }
+      } else {
+        setOllamaStatus('disconnected');
+      }
     } catch {
       setOllamaStatus('disconnected');
     }
@@ -37,7 +53,7 @@ export default function AjustesView() {
     if (isLoaded && settings.mode === 'pc') {
       checkOllamaConnection();
     }
-  }, [isLoaded, settings.mode, settings.ollamaUrl]);
+  }, [isLoaded, settings.mode, settings.ollamaUrl, settings.bridgeUrl]);
 
   // Export backup
   const handleExport = () => {
@@ -263,6 +279,22 @@ export default function AjustesView() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div>
+                <label className="text-xs text-[var(--color-text-secondary)] mb-1 block">
+                  Bridge URL <span className="text-[var(--color-text-secondary)]/60">(opcional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={settings.bridgeUrl || ''}
+                  onChange={(e) => updateSettings({ bridgeUrl: e.target.value })}
+                  placeholder="http://192.168.x.x:5001"
+                  className="w-full p-2.5 bg-[var(--color-input-bg)] rounded-lg border border-[var(--color-border)] focus:border-[var(--color-primary)] outline-none text-[var(--color-text-primary)] text-sm font-mono"
+                />
+                <p className="text-[10px] text-[var(--color-text-secondary)]/70 mt-1">
+                  Para conectar desde Vercel a tu Mac. Corre <code className="bg-[var(--color-input-bg)] px-1 rounded">kaede-bridge</code> en tu Mac.
+                </p>
               </div>
 
               {ollamaStatus === 'disconnected' && (
