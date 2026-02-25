@@ -24,6 +24,9 @@ export async function checkOllamaAvailable(ollamaUrl: string, bridgeUrl?: string
     
     const response = await fetch(targetUrl, {
       method: 'GET',
+      headers: {
+        'ngrok-skip-browser-warning': 'true',
+      },
       signal: AbortSignal.timeout(5000),
     });
     
@@ -135,7 +138,10 @@ export async function compressContextWithOllama(
     
     const response = await fetch(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true' 
+      },
       body: JSON.stringify({
         model: ollamaModel,
         messages: [
