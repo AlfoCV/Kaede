@@ -29,6 +29,10 @@ export default function AjustesView() {
       
       const response = await fetch(targetUrl, {
         method: 'GET',
+        headers: {
+          // Header para omitir la página de advertencia de ngrok
+          'ngrok-skip-browser-warning': 'true',
+        },
         signal: AbortSignal.timeout(5000),
       });
       
