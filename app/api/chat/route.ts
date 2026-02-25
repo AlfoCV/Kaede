@@ -103,7 +103,7 @@ async function handleCloudRequest(
   // Usar el modelo especificado (gpt-5.2 por defecto)
   const useModel = model || 'gpt-5.2';
 
-  const response = await fetch('https://routellm.abacus.ai/v1/chat/completions', {
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -113,14 +113,14 @@ async function handleCloudRequest(
       model: useModel,
       messages: contextMessages,
       stream: true,
-      max_tokens: maxTokens,
+      max_completion_tokens: maxTokens,
       temperature: temperature,
     }),
   });
 
   if (!response?.ok) {
     const error = await response?.text?.();
-    console.error('RouteLLM API error:', error);
+    console.error('OpenAI API error:', error);
     return NextResponse.json({ error: 'Failed to get response from OpenAI' }, { status: 500 });
   }
 
