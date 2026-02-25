@@ -31,7 +31,7 @@ export default function Sidebar({ currentView, onNavigate }: SidebarProps) {
     : { icon: Cloud, label: 'Modo Nube', color: 'bg-[var(--color-success)]' };
 
   return (
-    <aside className="hidden md:flex w-64 bg-[var(--color-primary)] flex-col h-full">
+    <aside className="flex w-64 bg-[var(--color-primary)] flex-col h-full">
       {/* Logo Section */}
       <div className="p-6 border-b border-white/10">
         <h1 className="text-2xl font-poppins font-bold text-[var(--color-background)] text-center">Kaede</h1>
