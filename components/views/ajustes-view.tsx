@@ -298,12 +298,12 @@ export default function AjustesView() {
               </div>
 
               {ollamaStatus === 'disconnected' && (
-                <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg">
-                  <p className="text-xs text-amber-800 dark:text-amber-200 font-medium mb-2">Para usar Modo PC:</p>
-                  <ol className="text-[10px] text-amber-700 dark:text-amber-300 space-y-1 list-decimal list-inside">
-                    <li>Instala Ollama: <code className="bg-amber-100 dark:bg-amber-800 px-1 rounded">brew install ollama</code></li>
-                    <li>Inicia el servidor: <code className="bg-amber-100 dark:bg-amber-800 px-1 rounded">ollama serve</code></li>
-                    <li>Descarga un modelo: <code className="bg-amber-100 dark:bg-amber-800 px-1 rounded">ollama pull {settings.ollamaModel}</code></li>
+                <div className="p-3 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 rounded-lg">
+                  <p className="text-xs text-blue-900 dark:text-blue-100 font-medium mb-2">Para usar Modo PC:</p>
+                  <ol className="text-[10px] text-blue-800 dark:text-blue-200 space-y-1 list-decimal list-inside">
+                    <li>Instala Ollama: <code className="bg-blue-100 dark:bg-blue-800 text-blue-900 dark:text-blue-100 px-1 rounded">brew install ollama</code></li>
+                    <li>Inicia el servidor: <code className="bg-blue-100 dark:bg-blue-800 text-blue-900 dark:text-blue-100 px-1 rounded">ollama serve</code></li>
+                    <li>Descarga un modelo: <code className="bg-blue-100 dark:bg-blue-800 text-blue-900 dark:text-blue-100 px-1 rounded">ollama pull {settings.ollamaModel}</code></li>
                   </ol>
                 </div>
               )}
